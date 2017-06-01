@@ -1,9 +1,11 @@
 from pprint import pprint
-from time import sleep
+from time import sleep, time
+from models import Data, DBSession
+from config import ME, TIMEOUT_THRESHOLD
+from sqlalchemy import and_
 import re
 
 
-ME = '1'
 DATA_PATTERN = re.compile('([0-9A-Fa-f]{1,3})\|([CR])\|([0-9,;]+)\|(.*)')
 
 
@@ -14,6 +16,13 @@ class ZigbeeService(object):
         self.port = port
         self.data_handler = data_handler
         self.running = True
+
+    def _cleanup(self):
+        now = time()
+        session = DBSession()
+        session.query(Data).filter(now - Data.timestamp > TIMEOUT_THRESHOLD).delete()
+        session.commit()
+        session.close()
 
     @staticmethod
     def parse_raw_data(data):
@@ -36,12 +45,12 @@ class ZigbeeService(object):
     def generate_raw_data(msg_id, prev_path, next_path, dtype, message):
         prev_path = ','.join(prev_path)
         next_path = ','.join(next_path)
-        return '{};{}|{}|{}\n'.format(prev_path, next_path, dtype, message)
+        return '{};{}|{}|{}'.format(prev_path, next_path, dtype, message)
 
     def send(self, data):
         sleep(0.5)
         if not isinstance(data, bytes):
-            data = data.encode()
+            data = (data + '\n').encode()
         return self.port.write(data)
 
     def recv(self):
@@ -64,6 +73,29 @@ class ZigbeeService(object):
     def sink_data(self):
         return
 
+    def is_unique(self, data):
+        session = DBSession()
+        ref_check = session.query(Data).filter(
+            and_(Data.msg_id == data['msg_id'],
+                 Data.dtype == data['dtype'])).count()
+        return ref_check == 0
+
+    def save_data(self, data):
+        session = DBSession()
+        temp = data.copy()
+        temp['timestamp'] = time()
+        new_record = Data(**temp)
+        session.add(new_record)
+        session.commit()
+        session.close()
+
+    def validate(self, data):
+        self._cleanup()
+        if self.is_unique(data):
+            self.save_data(data)
+            return True
+        return False
+
     def run(self):
         while self.running:
             print('\nLISTENING', end='')
@@ -76,51 +108,32 @@ class ZigbeeService(object):
                 print('INVALID DATA: "{}"'.format(raw_data))
                 print('SINKED')
                 continue
-            # Got a response data
-            if data['dtype'] == 'R':
-                # Got a response and no more hops
-                if len(data['next_path']) == 1:
-                    # Oh it's for me
-                    if data['next_path'][0] in ME:
-                        print('RESPONSE FROM COMMAND: "{}"'.format(raw_data))
-                        pprint(data)
-                        continue
-                    # It's not for me.
-                    else:
-                        print('SINKING')
-                        self.sink_data()
-                # Got a response and have some hops more.
-                elif data['next_path'][0] in ME:
-                    print('BOUNCING REPLY: "{}"'.format(raw_data))
-                    response = self.bounce_data(data)
-                    raw_response = self.generate_raw_data(**response)
-                    self.send(raw_response)
-            # Got a command and no more hops.
-            elif len(data['next_path']) == 1:
-                # It's for me. Doing my job
-                if data['next_path'][0] in ME:
-                    response = self.process_data(data)
-                    raw_response = self.generate_raw_data(**response)
-                    print('PROCESSING COMMAND: "{}"'.format(raw_data))
-                    print('SENDING REPLY: "{}"'.format(
-                        raw_response.strip('\n')))
-                    self.send(raw_response)
-                # Not for me. I don't care.
-                else:
-                    self.sink_data()
+            if not self.validate(data):
+                print('DUPLICATED PACKAGE, SINKING: "{}"'.format(raw_data))
+                continue
 
-            # Got a command, I'm on the path.
-            elif data['next_path'][0] in ME:
-                response = self.bounce_data(data)
-                raw_response = self.generate_raw_data(**response)
-                print('BOUNCING: "{}"'.format(raw_response.strip('\n')))
-                self.send(raw_response)
+            # Data is irrelevant
+            if ME not in data['next_path']:
+                print('IRRELEVANT DATA: "{}"'.format(raw_data))
+                print('SINKED.')
+                continue
 
-            # Got a command, I'm not on the path.
+            # Data should pass from me or data is for me.
+            fasten_flag = False
+            while ME != data['next_path'][0]:
+                fasten_flag = True
+                data = self.bounce_data(data)
+            if fasten_flag:
+                print('FASTER PROCESS!')
+
+            # Data is for me
+            if len(data['next_path']) == 1:
+                response = self.process_data(data)
+
+            # Data is not for me, but it should pass from me
             else:
-                print('IRRELEVANT FOR NOW: "{}"'.format(raw_data))
-                print('SINKED')
-                self.sink_data()
+                response = self.bounce_data(data)
+            self.send(response)
 
     def halt(self):
         self.running = False
